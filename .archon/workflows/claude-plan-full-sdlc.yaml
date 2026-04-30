@@ -1,0 +1,490 @@
+name: claude-plan-full-sdlc
+description: |
+  Use when: You have an existing implementation plan (e.g. from Claude /plan) and want
+  full multi-model SDLC execution — TDD, end-to-end testing, multi-model review, and
+  a clear completion summary before final approval.
+
+  Input: Path to a plan file passed via $ARGUMENTS.
+  Output: PR with multi-model review, parallel test generation, real-API e2e testing,
+  and CI monitoring.
+
+  Pipeline:
+    normalize-plan (incl. preflight) -> confirm-plan (human gate; supply missing data)
+    -> write-tests -> verify-red -> implement
+    -> run-tests -> e2e-test -> check-coverage
+    -> [review-logic || review-security || review-architecture]
+    -> synthesize-review -> completion-summary
+    -> human-review -> create-pr -> monitor-ci -> triage-failure?
+
+  NOT for: Plans that don't exist yet (use full-sdlc, which generates one from an idea).
+
+interactive: true
+
+nodes:
+  # ── Phase 1: Normalize Claude Plan + Preflight Audit ────────────────
+  - id: normalize-plan
+    provider: claude
+    model: opus
+    output_format:
+      type: object
+      properties:
+        scope: { type: string }
+        affected_files: { type: array, items: { type: string } }
+        acceptance_criteria: { type: array, items: { type: string } }
+        complexity: { enum: [trivial, moderate, complex] }
+        needs_human_review: { enum: [yes, no] }
+        needs_human_review_reason: { type: string }
+        preflight:
+          type: object
+          properties:
+            env_vars:           { type: array, items: { type: string } }
+            external_apis:      { type: array, items: { type: string } }
+            tools_required:     { type: array, items: { type: string } }
+            test_fixtures:      { type: array, items: { type: string } }
+            validation_commands: { type: array, items: { type: string } }
+            e2e_test_commands:  { type: array, items: { type: string } }
+            unknown_or_missing: { type: array, items: { type: string } }
+    prompt: |
+      Source plan path: $ARGUMENTS
+
+      Read the source plan AND inspect the project's actual toolchain
+      (look for package.json scripts, pyproject.toml, Makefile, Cargo.toml,
+      gradle, npm-installed CLIs in node_modules/.bin, etc.). Produce four
+      outputs.
+
+      1. An Archon-shaped plan written to $ARTIFACTS_DIR/plan.md with these sections:
+         - Title
+         - Summary (1–2 sentences)
+         - Files to Change (table with CREATE/UPDATE column)
+         - Acceptance Criteria (checklist — each item must be testable)
+         - Validation Steps (numbered list, each with: command, what it proves,
+           expected pass criteria — type-check, lint, unit tests, integration
+           tests, e2e tests, coverage threshold)
+         - End-to-End Test Plan (what scenarios exercise real external APIs;
+           which APIs; what data flows are covered; what's mocked vs real)
+         - Preflight Requirements (env vars, external API access, tools,
+           binaries, test fixtures — everything needed for a frictionless run)
+         - NOT Building / Scope Limits (intentional exclusions — CRITICAL for
+           review agents)
+         - Patterns to Mirror (file:line references for similar existing code)
+
+      2. Structured JSON matching this node's output_format. The `preflight`
+         object MUST list everything the workflow needs to run end-to-end with
+         real external APIs. Anything you can't determine from the source plan
+         goes in `unknown_or_missing` so the human gate can supply it.
+
+      3. $ARTIFACTS_DIR/test-commands.sh — an executable shell script that
+         runs the project's actual lint + type-check + unit-test commands,
+         each on its own line, in that order. Use the project's real
+         toolchain — examples:
+           - bun-TS repo: `bun run type-check && bun run lint && bun run test`
+           - npm/Node repo: `npm run lint && npm run typecheck && npm test`
+           - n8n + @swedenmark/n8n-workflows: `npm run workflow:check`
+           - Python uv: `uv run ruff check . && uv run pyright && uv run pytest`
+           - Cargo: `cargo clippy -- -D warnings && cargo test`
+         If the project legitimately has no testable code surface (pure
+         docs / config-only with no scripts at all), write a single line:
+           echo "NO_TEST_COMMANDS_DEFINED"
+         Make the file executable in your head — start with `#!/usr/bin/env bash`
+         and `set -e`. Output ONLY the file contents, written via the Write
+         tool. Do NOT echo it back in your reply.
+
+         CRITICAL: Do NOT include any `cd` commands in this script. The
+         workflow invokes it from the worktree's working directory; a
+         `cd <absolute-path>` line would escape the worktree and run tests
+         against the live checkout, silently bypassing isolation. Use only
+         commands relative to the current working directory (e.g.
+         `npm run lint`, not `cd /abs/path && npm run lint`). If the
+         project's commands genuinely require a subdirectory, use a
+         project-relative path (e.g. `cd packages/web && npm test`).
+
+      4. $ARTIFACTS_DIR/coverage-commands.sh — same shape, but for the
+         project's coverage check (e.g. `bun run coverage --threshold 80`,
+         `npm run coverage`, `pytest --cov --cov-fail-under=80`). If the
+         project has no coverage tooling, write:
+           echo "NO_COVERAGE_COMMAND_DEFINED"
+         The same "no absolute-path `cd`" rule from #3 applies here.
+
+      Rules:
+      - Preserve every decision, constraint, and detail from the source plan.
+      - Mark inferred sections with the prefix "INFERRED:" so the human gate
+        can verify them.
+      - Do NOT leave "NOT Building" empty — propose candidate exclusions
+        marked INFERRED if absent. The review agents rely on this section.
+      - Every Acceptance Criterion must map to at least one Validation Step.
+      - The End-to-End Test Plan must explicitly call out which external APIs
+        are touched and whether they're mocked or hit live. If no e2e tests
+        exist in the source plan, list candidate scenarios as INFERRED and
+        flag this in `preflight.unknown_or_missing`.
+
+      Set `needs_human_review` to "yes" if ANY of these are true:
+      - The plan.md you wrote contains any "INFERRED:" markers
+      - `preflight.unknown_or_missing` is non-empty
+      - You had to substantially restructure or interpret the source plan
+        (vs a near-verbatim translation)
+      - You're uncertain about scope, acceptance criteria, or any preflight
+        requirement
+      Set it to "no" ONLY when: the source plan was already well-shaped, you
+      copied sections near-verbatim, no INFERRED markers were needed, and
+      preflight is fully satisfied with no unknowns. When in doubt, choose
+      "yes" — a few seconds of reviewer attention costs less than a wrong
+      assumption that blows up downstream.
+
+      Set `needs_human_review_reason` to a one-sentence explanation of why
+      the gate should fire (or why it can be skipped). This is what the
+      reviewer sees first.
+
+  # ── Phase 2: Human Gate ─────────────────────────────────────────────
+  # Always fires. The previous AI-judged `when:` gate (skipping when
+  # normalize-plan said `needs_human_review: "no"`) removed the human
+  # from the loop entirely whenever the model self-graded its rewrite as
+  # clean — a single-point-of-failure on AI judgment. The reviewer can
+  # still approve in seconds when the plan looks fine; the asymmetry
+  # (cheap to approve, expensive to discover the AI missed something
+  # downstream) makes "always ask" the right default for an SDLC flow.
+  - id: confirm-plan
+    depends_on: [normalize-plan]
+    approval:
+      message: |
+        Plan normalized. Reviewer attention requested:
+        $normalize-plan.output.needs_human_review_reason
+
+        Review $ARTIFACTS_DIR/plan.md before implementation begins.
+
+        Three things to verify at this gate:
+        1. Anything marked "INFERRED:" — was the inference correct?
+        2. Preflight Requirements section — are all env vars set, all
+           external APIs reachable, all credentials in place, all required
+           tools installed? Items in `preflight.unknown_or_missing` need
+           your input. Without these, downstream e2e testing will fail
+           spuriously and waste agent time.
+        3. Toolchain commands — open $ARTIFACTS_DIR/test-commands.sh and
+           $ARTIFACTS_DIR/coverage-commands.sh. These are the EXACT commands
+           the workflow will run for the test gate and coverage gate. If
+           they reference the wrong package manager (bun vs npm vs uv) or
+           the wrong scripts for this project, reject with the correct
+           commands.
+
+        Approve to proceed (implies preflight + toolchain commands are
+        correct), or reject with corrections + the missing data.
+      capture_response: true
+      on_reject:
+        prompt: |
+          Update $ARTIFACTS_DIR/plan.md based on this feedback:
+          $REJECTION_REASON
+
+          Re-emit the structured scope JSON in the same output_format,
+          incorporating any new preflight info the user supplied. Move
+          resolved items out of `unknown_or_missing`.
+
+  # ── Phase 3: TDD — Write Tests First ────────────────────────────────
+  # trigger_rule: all_done lets this run whether confirm-plan executed
+  # (gate fired and was approved) or was skipped (gate's `when:` was false).
+  - id: write-tests
+    depends_on: [confirm-plan]
+    trigger_rule: all_done
+    provider: codex
+    prompt: |
+      Read $ARTIFACTS_DIR/plan.md.
+
+      Write tests FIRST, before any implementation exists. For each
+      Acceptance Criterion, write at least one test that would fail
+      against the current codebase and pass once the feature is built.
+
+      Coverage:
+      - Unit tests: each new function / module
+      - Integration tests: each module boundary touched
+      - End-to-End tests: every scenario in the plan's "End-to-End Test
+        Plan" section, hitting real external APIs where the plan says so
+      - Edge cases, error paths, boundary conditions
+
+      Match the existing test framework. Do NOT modify any source files —
+      tests only. Tests should currently fail (red phase) — that's
+      verified next.
+
+  - id: verify-red
+    depends_on: [write-tests]
+    bash: |
+      # Red phase: new tests should fail because the feature isn't built yet.
+      # If they pass, the tests aren't actually testing the new behavior.
+      # Uses the toolchain-aware test-commands.sh emitted by normalize-plan.
+      if [ -f "$ARTIFACTS_DIR/test-commands.sh" ]; then
+        bash "$ARTIFACTS_DIR/test-commands.sh" 2>&1 | tee $ARTIFACTS_DIR/red-phase.log
+        if [ "${PIPESTATUS[0]}" -eq 0 ]; then
+          echo "WARNING: tests pass without implementation — they may not be testing new behavior" \
+            | tee -a $ARTIFACTS_DIR/red-phase.log
+        else
+          echo "RED phase confirmed: tests fail as expected before implementation" \
+            | tee -a $ARTIFACTS_DIR/red-phase.log
+        fi
+      else
+        echo "NO_TEST_COMMANDS_DEFINED — verify-red is a no-op (test-commands.sh not generated)" \
+          | tee $ARTIFACTS_DIR/red-phase.log
+      fi
+      # Don't fail the workflow — failing tests at this point is the goal,
+      # and a missing test toolchain is also acceptable here.
+      exit 0
+
+  # ── Phase 4: Implementation (Green Phase) ───────────────────────────
+  - id: implement
+    depends_on: [verify-red]
+    provider: claude
+    model: sonnet
+    loop:
+      prompt: |
+        Read $ARTIFACTS_DIR/plan.md.
+        Read $ARTIFACTS_DIR/red-phase.log to see which tests are currently
+        failing.
+
+        Find the next task in plan.md that is NOT marked `[x]`. If one
+        exists, implement it to make its corresponding tests pass:
+        run `bash $ARTIFACTS_DIR/test-commands.sh` (the project's
+        toolchain-correct test command pipeline), then mark the task
+        complete only when its tests are green.
+
+        EXIT CONDITIONS — when EITHER of these is true, you MUST output
+        exactly the line `ALL_TASKS_COMPLETE` on its own line, with
+        nothing after it, and stop immediately:
+          1. Every task in plan.md is already marked `[x]`.
+          2. You just marked the final task complete and tests are green.
+
+        Do NOT summarize, do NOT add a closing paragraph, do NOT call
+        any further tools after emitting ALL_TASKS_COMPLETE. The literal
+        token must be the last line of your response.
+      until: ALL_TASKS_COMPLETE
+      # Deterministic backstop: exits the loop when no `- [ ]` remains
+      # in plan.md, regardless of whether the agent emitted the literal
+      # ALL_TASKS_COMPLETE token. Survives prompt drift. Exit 0 = done.
+      until_bash: '! grep -q "^- \[ \]" $ARTIFACTS_DIR/plan.md'
+      fresh_context: true
+      max_iterations: 12
+
+  # ── Phase 5a: Test Refinement (post-implementation tightening) ──────
+  - id: refine-tests
+    depends_on: [implement]
+    provider: codex
+    loop:
+      prompt: |
+        The implementation is now real. Tighten test coverage.
+
+        Read:
+        - $ARTIFACTS_DIR/plan.md (Acceptance Criteria, End-to-End Test Plan,
+          NOT Building)
+        - The diff: `git diff $BASE_BRANCH..HEAD`
+        - Current test results: `bash $ARTIFACTS_DIR/test-commands.sh`
+
+        Your job:
+        - Identify acceptance criteria that are weakly covered (only
+          happy-path, no error cases, no boundaries).
+        - Identify edge cases the implementation surfaced that aren't yet
+          tested: new error branches, defensive checks, race conditions,
+          off-by-one boundaries, retry/backoff paths around external APIs.
+        - Add tests for those gaps. Match the existing test framework.
+        - Re-run the suite. All tests (existing + new) must pass.
+
+        Constraints:
+        - Tests only. Do NOT modify any source files.
+        - Do NOT add tests for items in the plan's "NOT Building" section.
+
+        Two valid exit conditions:
+        1. Tests tightened, full suite green → output the literal string
+           REFINEMENT_COMPLETE.
+        2. A newly-added test fails because the implementation has a real
+           gap (not a bad test) → keep the test, write
+           $ARTIFACTS_DIR/test-gaps.md describing the gap with file:line
+           references, then output REFINEMENT_COMPLETE. Downstream review
+           will surface this for the human gate.
+
+        Stop iterating once you can output REFINEMENT_COMPLETE.
+      until: REFINEMENT_COMPLETE
+      fresh_context: true
+      max_iterations: 4
+
+  # ── Phase 5b: Deterministic Validation ──────────────────────────────
+  - id: run-tests
+    depends_on: [refine-tests]
+    bash: |
+      # Toolchain-agnostic: normalize-plan emits the project's actual
+      # lint / type-check / test commands to test-commands.sh. We just
+      # execute that. Same "no-op when missing" pattern as e2e-test.
+      if [ -f "$ARTIFACTS_DIR/test-commands.sh" ]; then
+        bash "$ARTIFACTS_DIR/test-commands.sh" 2>&1 \
+          | tee "$ARTIFACTS_DIR/test-results.log"
+      else
+        echo "NO_TEST_COMMANDS_DEFINED — run-tests skipped (test-commands.sh not generated)" \
+          | tee "$ARTIFACTS_DIR/test-results.log"
+      fi
+
+  - id: e2e-test
+    depends_on: [run-tests]
+    bash: |
+      # Runs the e2e_test_commands the plan listed. If the plan didn't list
+      # any (and the human gate didn't add any), this is a no-op with a
+      # warning surfaced in the completion-summary step.
+      if [ -f "$ARTIFACTS_DIR/e2e-commands.sh" ]; then
+        bash "$ARTIFACTS_DIR/e2e-commands.sh" 2>&1 | tee "$ARTIFACTS_DIR/e2e-results.log"
+      else
+        echo "NO_E2E_COMMANDS_DEFINED" | tee "$ARTIFACTS_DIR/e2e-results.log"
+      fi
+
+  - id: check-coverage
+    depends_on: [e2e-test]
+    bash: |
+      # Toolchain-agnostic: normalize-plan emits the project's coverage
+      # command to coverage-commands.sh, or NO_COVERAGE_COMMAND_DEFINED
+      # for projects without coverage tooling.
+      if [ -f "$ARTIFACTS_DIR/coverage-commands.sh" ]; then
+        bash "$ARTIFACTS_DIR/coverage-commands.sh" 2>&1 \
+          | tee "$ARTIFACTS_DIR/coverage-results.log"
+      else
+        echo "NO_COVERAGE_COMMAND_DEFINED — check-coverage skipped (coverage-commands.sh not generated)" \
+          | tee "$ARTIFACTS_DIR/coverage-results.log"
+      fi
+
+  # ── Phase 6: Parallel Multi-Model Code Review ───────────────────────
+  - id: review-logic
+    depends_on: [check-coverage]
+    provider: claude
+    model: opus
+    allowed_tools: [Read, Grep, Glob]
+    prompt: |
+      Review all changes for logic correctness, edge cases, multi-file
+      consistency. The "NOT Building" section in $ARTIFACTS_DIR/plan.md
+      lists intentional exclusions — do NOT flag them as missing features.
+      Write findings to $ARTIFACTS_DIR/review-logic.md
+
+  - id: review-security
+    depends_on: [check-coverage]
+    provider: codex
+    prompt: |
+      Review all changes for security: injection, auth, OWASP Top 10,
+      secrets exposure, input validation. Pay special attention to any
+      external API calls — auth, key handling, retry/backoff, error
+      surfaces.
+      Write findings to $ARTIFACTS_DIR/review-security.md
+
+  - id: review-architecture
+    depends_on: [check-coverage]
+    provider: claude
+    model: opus
+    prompt: |
+      Review all changes for architectural drift, module boundary
+      violations, naming, pattern consistency, and unnecessary
+      abstractions. The "NOT Building" section in $ARTIFACTS_DIR/plan.md
+      lists intentional exclusions — do NOT flag them as architectural
+      gaps.
+      Write findings to $ARTIFACTS_DIR/review-arch.md
+
+  - id: synthesize-review
+    depends_on: [review-logic, review-security, review-architecture]
+    provider: claude
+    model: sonnet
+    prompt: |
+      Synthesize findings from $ARTIFACTS_DIR/review-*.md into a single
+      prioritized list of: blockers, warnings, suggestions.
+      Write to $ARTIFACTS_DIR/review-summary.md
+
+  # ── Phase 7: Completion Summary (Pre-Approval Audit) ────────────────
+  - id: completion-summary
+    depends_on: [synthesize-review]
+    provider: claude
+    model: opus
+    prompt: |
+      Produce a crystal-clear completion summary so the human reviewer
+      knows exactly what was accomplished, what wasn't, and where the
+      gaps are. No glossing over, no marketing tone.
+
+      Read everything:
+      - $ARTIFACTS_DIR/plan.md (acceptance criteria, validation steps,
+        e2e plan, preflight)
+      - $ARTIFACTS_DIR/red-phase.log
+      - $ARTIFACTS_DIR/test-gaps.md (if present — flagged implementation
+        gaps from the refine-tests step; surface these prominently)
+      - $ARTIFACTS_DIR/e2e-results.log
+      - $ARTIFACTS_DIR/review-summary.md
+      - The actual diff (`git diff $BASE_BRANCH..HEAD`)
+      - Test runner output, coverage report
+
+      Write $ARTIFACTS_DIR/completion-summary.md with these sections:
+
+      ## Acceptance Criteria
+      Table: each criterion → status (✅ done / ⚠️ partial / ❌ not done)
+        → which test(s) prove it → notes on partial/missed.
+
+      ## What Was Built
+      Bullet list of concrete changes mapped to plan tasks. Be specific:
+      file paths, function names, behavior delivered.
+
+      ## What Was NOT Built
+      Anything from the plan that didn't ship. Distinguish between
+      (a) intentional NOT Building exclusions, (b) deferred to follow-up,
+      (c) gaps the workflow surfaced but didn't address.
+
+      ## Testing Coverage
+      Table: type-check / lint / unit / integration / e2e / coverage% —
+      each row: command run, result, what it proves. Be explicit about
+      which acceptance criteria are NOT covered by tests.
+
+      ## End-to-End Coverage
+      For each external API or integration in the plan: was it tested
+      against a live endpoint, mocked, or untested? Cite log evidence.
+      If `e2e-results.log` shows NO_E2E_COMMANDS_DEFINED, say so plainly.
+
+      ## Review Findings Status
+      Pull each blocker/warning from review-summary.md and mark
+      addressed / deferred / disputed.
+
+      ## Known Gaps & Risks
+      Anything the reviewer should know before approving: untested paths,
+      preflight items still missing, deviations from the plan, risky
+      assumptions.
+
+      ## Recommended Decision
+      One of: APPROVE / APPROVE WITH FOLLOWUPS / REJECT, with reasoning.
+
+  # ── Phase 8: Human Approval Gate ────────────────────────────────────
+  - id: human-review
+    depends_on: [completion-summary]
+    approval:
+      message: |
+        Completion summary at $ARTIFACTS_DIR/completion-summary.md
+        Review summary at $ARTIFACTS_DIR/review-summary.md
+
+        Approve to create PR, or reject with feedback.
+      capture_response: true
+      on_reject:
+        prompt: |
+          Address: $REJECTION_REASON
+          Re-implement affected areas, re-run validation + e2e, regenerate
+          completion-summary.md, then re-present for approval.
+
+  # ── Phase 9: PR Creation ────────────────────────────────────────────
+  - id: create-pr
+    depends_on: [human-review]
+    provider: claude
+    model: sonnet
+    prompt: |
+      Push the branch. Create a pull request.
+      Title: derived from the normalized plan title in $ARTIFACTS_DIR/plan.md.
+      Body: lift the completion-summary.md contents into the PR body
+      (Acceptance Criteria table, What Was/Wasn't Built, Testing Coverage,
+      Known Gaps), and link to the originating plan.
+
+  # ── Phase 10: CI Monitoring ─────────────────────────────────────────
+  - id: monitor-ci
+    depends_on: [create-pr]
+    provider: codex
+    prompt: |
+      Monitor GitHub Actions for this PR. Report CI status.
+      If any job fails, capture the failing log section.
+      Write status to $ARTIFACTS_DIR/ci-status.md
+
+  - id: triage-failure
+    depends_on: [monitor-ci]
+    when: "$monitor-ci.output contains 'FAILURE'"
+    provider: claude
+    model: sonnet
+    prompt: |
+      CI failure: $monitor-ci.output
+      Analyze root cause. Propose a targeted fix.
+      Open a new GitHub issue with the diagnosis.
